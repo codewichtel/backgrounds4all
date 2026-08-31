@@ -1,0 +1,223 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$SourcePath = (Join-Path $PSScriptRoot 'bg'),
+
+    [Parameter(Mandatory = $false)]
+    [switch]$RemoveManagedBackgrounds
+)
+
+$ErrorActionPreference = 'Stop'
+
+$PackageName = 'Teams-Backgrounds-GPO'
+$StateFolder = Join-Path $env:LOCALAPPDATA $PackageName
+$StateFile   = Join-Path $StateFolder 'managed-backgrounds.json'
+$LogFolder   = Join-Path $env:LOCALAPPDATA "$PackageName\Logs"
+$LogFile     = Join-Path $LogFolder 'Deploy-TeamsBackgrounds.log'
+
+# New Microsoft Teams (MSIX)
+$TeamsBackgroundFolder = Join-Path $env:LOCALAPPDATA 'Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Backgrounds\Uploads'
+
+$AllowedExtensions = @('.jpg', '.jpeg', '.png', '.bmp')
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
+    )
+
+    if (-not (Test-Path -LiteralPath $LogFolder)) {
+        New-Item -ItemType Directory -Path $LogFolder -Force | Out-Null
+    }
+
+    $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
+    Write-Verbose $line
+}
+
+function Get-StableGuid {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    # Deterministische GUID aus dem Dateinamen.
+    # Dadurch entstehen bei jedem GPO-Logon keine neuen Dateien.
+    $normalized = $Value.Trim().ToLowerInvariant()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+
+    try {
+        $hash = $sha256.ComputeHash($bytes)
+    }
+    finally {
+        $sha256.Dispose()
+    }
+
+    $guidBytes = New-Object byte[] 16
+    [Array]::Copy($hash, 0, $guidBytes, 0, 16)
+
+    return [Guid]::new($guidBytes).Guid
+}
+
+function Get-FileHashSafe {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+try {
+    Write-Log "Starting deployment. User=$env:USERNAME SourcePath=$SourcePath"
+
+    if (-not (Test-Path -LiteralPath $StateFolder)) {
+        New-Item -ItemType Directory -Path $StateFolder -Force | Out-Null
+    }
+
+    if (-not (Test-Path -LiteralPath $TeamsBackgroundFolder)) {
+        New-Item -ItemType Directory -Path $TeamsBackgroundFolder -Force | Out-Null
+        Write-Log "Created Teams background folder: $TeamsBackgroundFolder"
+    }
+
+    $oldState = @()
+
+    if (Test-Path -LiteralPath $StateFile) {
+        try {
+            $loadedState = Get-Content -LiteralPath $StateFile -Raw -Encoding UTF8 |
+                ConvertFrom-Json
+
+            if ($null -ne $loadedState) {
+                $oldState = @($loadedState)
+            }
+        }
+        catch {
+            Write-Log "State file could not be read and will be rebuilt: $($_.Exception.Message)" 'WARN'
+            $oldState = @()
+        }
+    }
+
+    # Rollback / Deinstallation
+    if ($RemoveManagedBackgrounds) {
+
+        foreach ($entry in $oldState) {
+
+            foreach ($managedFile in @($entry.Target, $entry.Thumbnail)) {
+
+                if ($managedFile -and (Test-Path -LiteralPath $managedFile)) {
+                    Remove-Item -LiteralPath $managedFile -Force
+                    Write-Log "Removed managed file: $managedFile"
+                }
+            }
+        }
+
+        if (Test-Path -LiteralPath $StateFile) {
+            Remove-Item -LiteralPath $StateFile -Force
+        }
+
+        Write-Log 'Removal completed.'
+        exit 0
+    }
+
+    if (-not (Test-Path -LiteralPath $SourcePath)) {
+        throw "Source folder not found: $SourcePath"
+    }
+
+    $sourceFiles = @(
+        Get-ChildItem -LiteralPath $SourcePath -File |
+            Where-Object {
+                $AllowedExtensions -contains $_.Extension.ToLowerInvariant()
+            } |
+            Sort-Object Name
+    )
+
+    if ($sourceFiles.Count -eq 0) {
+        Write-Log "No supported background images found in $SourcePath" 'WARN'
+    }
+
+    $newState = @()
+
+    $expectedTargets =
+        [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+
+    foreach ($sourceFile in $sourceFiles) {
+
+        $guid = Get-StableGuid -Value $sourceFile.Name
+        $extension = $sourceFile.Extension.ToLowerInvariant()
+
+        $target = Join-Path $TeamsBackgroundFolder "$guid$extension"
+        $thumbnail = Join-Path $TeamsBackgroundFolder "${guid}_thumb$extension"
+
+        $sourceHash = Get-FileHashSafe -Path $sourceFile.FullName
+
+        [void]$expectedTargets.Add($target)
+        [void]$expectedTargets.Add($thumbnail)
+
+        $existing = $oldState |
+            Where-Object { $_.SourceName -eq $sourceFile.Name } |
+            Select-Object -First 1
+
+        $needsCopy = $true
+
+        if (
+            $existing -and
+            $existing.Hash -eq $sourceHash -and
+            (Test-Path -LiteralPath $target) -and
+            (Test-Path -LiteralPath $thumbnail)
+        ) {
+            $needsCopy = $false
+        }
+
+        if ($needsCopy) {
+
+            Copy-Item `
+                -LiteralPath $sourceFile.FullName `
+                -Destination $target `
+                -Force
+
+            Copy-Item `
+                -LiteralPath $sourceFile.FullName `
+                -Destination $thumbnail `
+                -Force
+
+            Write-Log "Installed/updated '$($sourceFile.Name)' as $guid$extension"
+        }
+        else {
+            Write-Log "No change: '$($sourceFile.Name)'"
+        }
+
+        $newState += [PSCustomObject]@{
+            SourceName = $sourceFile.Name
+            Hash       = $sourceHash
+            Guid       = $guid
+            Target     = $target
+            Thumbnail  = $thumbnail
+        }
+    }
+
+    # Nur Dateien entfernen, die von diesem Skript verwaltet wurden
+    # und zentral nicht mehr existieren.
+    foreach ($entry in $oldState) {
+
+        foreach ($managedFile in @($entry.Target, $entry.Thumbnail)) {
+
+            if (
+                $managedFile -and
+                -not $expectedTargets.Contains([string]$managedFile) -and
+                (Test-Path -LiteralPath $managedFile)
+            ) {
+                Remove-Item -LiteralPath $managedFile -Force
+                Write-Log "Removed obsolete managed file: $managedFile"
+            }
+        }
+    }
+
+    $newState |
+        ConvertTo-Json -Depth 4 |
+        Set-Content -LiteralPath $StateFile -Encoding UTF8 -Force
+
+    Write-Log "Deployment completed successfully. Managed backgrounds: $($newState.Count)"
+
+    exit 0
+}
+catch {
+    Write-Log $_.Exception.Message 'ERROR'
+    exit 1
+}
